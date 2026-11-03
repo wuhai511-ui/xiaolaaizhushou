@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.local.json
+*.local.sqlite3
+*.log
+desktop-demo*/
