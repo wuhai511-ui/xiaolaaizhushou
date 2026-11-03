@@ -1,0 +1,17 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('pet-v51/pet.js', 'utf8').split('/* RANDOM_ACTIONS */')[1];
+assert.ok(source, 'random motion module exists');
+let callback, played = [], mode = 'idle', paused = false;
+const listeners = {};
+const parent = {};
+const window = {parent, XiaoLaPet:{getStatus:()=>({mode,bannerOpen:false}),play:name=>played.push(name)},addEventListener:(type,fn)=>listeners[type]=fn};
+const document = {hidden:false};
+const context={window,document,location:{search:'?mini=1'},URLSearchParams,Math:Object.assign(Object.create(Math),{random:()=>0}),setTimeout:fn=>{callback=fn},matchMedia:()=>({matches:false})};
+vm.runInNewContext(source,context);
+callback(); assert.deepEqual(played,['welcome']);
+mode='thinking'; callback(); assert.equal(played.length,1);
+mode='idle'; listeners.message({source:parent,data:{type:'xiaola:autoplay',enabled:false}}); callback(); assert.equal(played.length,1);
+listeners.message({source:parent,data:{type:'xiaola:autoplay',enabled:true}}); callback(); assert.equal(played.length,2); assert.notEqual(played[0],played[1]);
+console.log('random actions, pause and busy-state checks passed');

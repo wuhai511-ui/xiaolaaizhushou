@@ -1,0 +1,24 @@
+{
+  "stores": [
+    {
+      "id": "sample-store",
+      "name": "示例门店（未联调）",
+      "jiaofeiyi": {
+        "merchantNo": "",
+        "terminalNo": ""
+      },
+      "dianpiaotong": {
+        "merchantNo": "",
+        "channel": ""
+      },
+      "records": [
+        {
+          "id": "sample-order",
+          "orderNo": "EXAMPLE-001",
+          "amountYuan": "10.00",
+          "label": "示例业务订单"
+        }
+      ]
+    }
+  ]
+}
