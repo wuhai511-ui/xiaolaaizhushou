@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <link rel="stylesheet" href="style.css?v=20261103-orders">
+  <link rel="stylesheet" href="style.css?v=20261103-workbench">
   <title>行业业务工作台 · 订单列表</title>
 </head>
 <body class="saas-body orders-page">
   <div class="saas-top"><b>◈ <span id="industry">园区</span>业务工作台</b><span>测试环境 · 示例工作台</span></div>
   <div class="saas-layout">
-    <aside class="saas-menu"><span>工作台</span><span>业务管理</span><b>订单列表</b><span>客户管理</span></aside>
+    <aside class="saas-menu"><span>工作台</span><span>业务管理</span><b>订单列表</b><a class="menu-link" href="suppliers.html">供应商管理</a><span>客户管理</span></aside>
     <main class="saas-main order-main">
       <div class="saas-heading order-heading"><div><small>WORKSPACE / 业务管理</small><h1>订单列表</h1><p>查看和管理订单，让小拉协助处理订单业务。</p></div><span class="mode">测试环境</span></div>
       <section class="order-panel" aria-label="订单列表">
@@ -21,15 +21,5 @@
       <p class="order-disclaimer">本工作台为测试演示；新增订单只在浏览器保存，不代表创建了支付订单或完成商户授权。</p>
     </main>
   </div>
-  <dialog id="order-dialog" class="order-dialog" aria-labelledby="order-dialog-title">
-    <form id="order-form">
-      <div class="dialog-head"><div><span class="order-kicker">NEW ORDER / 新建业务</span><h2 id="order-dialog-title">新增订单</h2><p>创建一笔示例业务订单，随后交给小拉处理。</p></div><button class="dialog-close" type="button" id="order-close" aria-label="关闭">×</button></div>
-      <label for="new-order-no">SaaS 业务订单号 <span>*</span></label><input id="new-order-no" name="orderNo" maxlength="32" required autocomplete="off" placeholder="字母、数字、短横线或下划线">
-      <label for="new-product">商品或服务名称 <span>*</span></label><input id="new-product" name="product" maxlength="100" required autocomplete="off" placeholder="例如：月度服务费">
-      <label for="new-amount">订单金额（元） <span>*</span></label><input id="new-amount" name="amount" type="text" inputmode="decimal" required autocomplete="off" placeholder="例如：100.00">
-      <p id="order-error" class="order-error" role="alert" hidden></p><p class="dialog-note">仅创建本地示例业务订单；需要收款时，可在小拉中继续办理。</p>
-      <div class="dialog-actions"><button id="order-cancel" class="ghost" type="button">取消</button><button id="order-create" type="submit">创建并打开小拉 ↗</button></div>
-    </form>
-  </dialog>
-  <script>window.XiaoLaConfig={};</script><script src="xiaola-widget.js?v=39"></script><script src="saas.js?v=21"></script>
+  <script src="workbench-data.js?v=3"></script><script>window.XiaoLaConfig={};</script><script src="xiaola-widget.js?v=50"></script><script src="saas.js?v=28"></script>
 </body></html>

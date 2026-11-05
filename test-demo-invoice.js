@@ -1,0 +1,11 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
+const src=fs.readFileSync('xiaola-chat.js','utf8');
+const start=src.indexOf(' function demoInvoiceData('),end=src.indexOf(' function openChatBusiness(',start);
+assert(start>=0&&end>start,'演示数据函数应存在');
+const ctx={};vm.createContext(ctx);vm.runInContext(src.slice(start,end),ctx);
+let d=ctx.demoInvoiceData({storeId:'test-store',orderNo:'SAAS-20261103-2E4204A5',amountYuan:'0.01'});
+assert.equal(d.merchantNo,'82212107311000H');assert.equal(d.channel,'KINGDEE');assert.equal(d.orderAmount,'0.01');assert.equal(d.invoiceAmount,'466');assert.match(d.notice,/演示映射/);
+assert.equal(ctx.demoInvoiceData({storeId:'test-store',orderNo:'other'}),null);
+assert.equal(ctx.demoInvoiceData({storeId:'other',orderNo:'SAAS-20261103-2E4204A5'}),null);
+assert.match(src,/if\(item\.name==='lqInvoiceCreate'&&!flow&&!skipDemo&&showDemoInvoice\(\)\)return/);
+console.log('demo invoice defaults scoped to the historical test order');

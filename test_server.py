@@ -16,6 +16,21 @@ class Tests(unittest.TestCase):
         with patch.object(server,'load_demo_stores',return_value=sample):
             self.assertEqual(server.demo_workspace('s1')['records'][0]['payment'],{'type':'merchantOrderNo','id':'o1','product':'jiaofeiyi'})
             self.assertIsNone(server.demo_workspace('s1')['records'][1]['payment']);self.assertIsNone(server.demo_workspace('s2')['records'][0]['payment'])
+    def test_historical_invoice_is_candidate_not_authorized_mapping(self):
+        store={'id':'s1','name':'test','jiaofeiyi':{},'dianpiaotong':{'merchantNo':'historical','channel':'KINGDEE','mappingStatus':'unverified_historical_test'},'demoInvoiceMappings':[{'orderNo':'O1','association':'演示映射，非真实业务关联','invoiceAmountYuan':'466.00'}],'records':[]}
+        with patch.object(server,'load_demo_stores',return_value=[store]):
+            data=server.demo_workspace('s1')
+            self.assertEqual(data['businessContext']['dianpiaotong']['merchantNo'],'')
+            self.assertEqual(data['invoiceCandidate']['merchantNo'],'historical')
+            self.assertIn('非真实',data['demoInvoiceMappings'][0]['association'])
+
+    def test_workspace_exposes_explicit_test_invoice_defaults_only(self):
+        store={'id':'s','name':'测试','jiaofeiyi':{},'dianpiaotong':{},'invoiceTestDefaults':{'merchant_no':'DPT','channel':'KINGDEE','buyer':{'name':'个人'},'seller':{'address':'测试地址','bank_name':'测试银行','bank_account':'test-account'},'extra':'ignored'},'records':[]}
+        with patch.object(server,'load_demo_stores',return_value=[store]):
+            data=server.demo_workspace('s')
+        self.assertEqual(data['invoiceTestDefaults']['merchant_no'],'DPT')
+        self.assertEqual(data['invoiceTestDefaults']['buyer']['name'],'个人')
+        self.assertNotIn('extra',data['invoiceTestDefaults'])
     def test_discovery_follows_cursor_and_rejects_duplicates(self):
         one={'name':'a','inputSchema':{}};two={'name':'b','inputSchema':{}}
         with patch.object(server,'upstream_rpc',side_effect=[{'tools':[one],'nextCursor':'next'},{'tools':[two]}]) as rpc:
@@ -112,11 +127,32 @@ class Tests(unittest.TestCase):
         with patch.object(server,'urlopen') as upstream:
             status,_=self.web_query({'name':'qztOrderComplete','arguments':{}})
             self.assertEqual(status,400);upstream.assert_not_called()
+    def test_browser_cannot_claim_payment_success(self):
+        conn=HTTPConnection('127.0.0.1',self.http.server_port,timeout=5)
+        conn.request('POST','/api/workbench/save',json.dumps({'kind':'payment','state':'paid'}),{'Host':'127.0.0.1:8098','Origin':'http://127.0.0.1:8098','Content-Type':'application/json'})
+        response=conn.getresponse();self.assertEqual(response.status,400);response.read();conn.close()
+    def test_payment_query_reports_safe_platform_error_code(self):
+        payload={'result':{'isError':True,'content':[{'type':'text','text':json.dumps({'error':{'platform_code':'500','message':'secret-detail'}})}]}}
+        with patch.object(server,'urlopen',return_value=Response(json.dumps(payload).encode())):
+            status,body=self.web_query({'name':'jiaofeiyiOrderQuery','arguments':{'merchant_no':'M','term_no':'T','out_order_no':'ORDER1'}})
+        self.assertEqual(status,200);self.assertFalse(json.loads(body)['ok']);self.assertIn('500',json.loads(body)['message']);self.assertNotIn(b'secret-detail',body)
     def test_web_widget_returns_only_minimum_business_fields(self):
         payload={'result':{'structuredContent':{'code':'000000','api':{'response_plaintext':'secret'},'resp_data':{'status':'SUCCESS','invoice_no':'123','files':[{'file_url':'secret'}]}}}}
         with patch.object(server,'urlopen',return_value=Response(json.dumps(payload).encode())):
             status,body=self.web_query({'name':'lqInvoiceQuery','arguments':{'merchant_no':'test','channel':'KINGDEE','request_id':'test','invoice_id':'test'}})
             self.assertEqual(status,200);self.assertEqual(json.loads(body)['data']['resp_data']['status'],'SUCCESS');self.assertNotIn(b'secret',body)
+
+    def test_invoice_delivery_links_require_verified_success_and_trusted_host(self):
+        files=[{'file_type':'PDF','file_url':'https://api-sit.piaozone.com/invoice/a?token=abc'}, {'file_type':'OFD','file_url':'https://evil.example/file'}, {'file_type':'XML','file_url':'https://api-sit.piaozone.com.evil.example/file'}]
+        data={'code':'000000','signature_verified':True,'resp_data':{'status':'SUCCESS','files':files}}
+        safe=server.safe_tool_result('lqInvoiceQuery',{'result':{'structuredContent':data}},1,include_invoice_files=True)['result']['structuredContent']
+        self.assertEqual(safe['resp_data']['files'],files[:1])
+        data['signature_verified']=False
+        safe=server.safe_tool_result('lqInvoiceQuery',{'result':{'structuredContent':data}},1,include_invoice_files=True)['result']['structuredContent']
+        self.assertNotIn('files',safe['resp_data'])
+        data['signature_verified']=True;data['resp_data']['status']='PROCESSING'
+        safe=server.safe_tool_result('lqInvoiceQuery',{'result':{'structuredContent':data}},1,include_invoice_files=True)['result']['structuredContent']
+        self.assertNotIn('files',safe['resp_data'])
 
     def test_full_catalog_and_confirmation_ticket(self):
         catalog=[{'name':'qztOrderComplete','description':'test','inputSchema':{'type':'object','required':['order_no']},'annotations':{'readOnlyHint':False}}]

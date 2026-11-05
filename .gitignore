@@ -4,3 +4,5 @@ __pycache__/
 *.local.sqlite3
 *.log
 desktop-demo*/
+
+logs/

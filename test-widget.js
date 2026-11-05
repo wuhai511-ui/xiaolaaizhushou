@@ -6,7 +6,7 @@ const frame={style:{},contentWindow:{postMessage:(...args)=>sent.push(args)},add
 const document={currentScript:{src:'http://127.0.0.1:8098/xiaola-widget.js'},baseURI:'http://127.0.0.1:8101/external-saas.html',getElementById:()=>null,createElement:()=>frame,body:{appendChild:()=>{}}};
 const window={XiaoLaConfig:{position:'left',offsetX:28,offsetY:20,title:'测试助手',merchantNo:' TEST001 ',terminalNo:'T001'},addEventListener:(name,fn)=>listeners[name]=fn};
 vm.runInNewContext(fs.readFileSync('xiaola-widget.js','utf8'),{document,window,URL});
-assert.equal(frame.src,'http://127.0.0.1:8098/xiaola-widget.html?v=39&title=%E6%B5%8B%E8%AF%95%E5%8A%A9%E6%89%8B&position=left');
+assert.equal(frame.src,'http://127.0.0.1:8098/xiaola-widget.html?v=50&title=%E6%B5%8B%E8%AF%95%E5%8A%A9%E6%89%8B&position=left');
 assert.equal(frame.style.left,'28px');
 assert.equal(frame.style.bottom,'20px');
 frameListeners.load();
@@ -50,11 +50,15 @@ const queuedFrame={style:{},contentWindow:{postMessage:(...a)=>queuedSent.push(a
 const queuedDoc={...document,createElement:()=>queuedFrame};
 const queuedWindow={XiaoLaConfig:{},addEventListener:()=>{}};
 vm.runInNewContext(fs.readFileSync('xiaola-widget.js','utf8'),{document:queuedDoc,window:queuedWindow,URL});
+queuedWindow.XiaoLa.openAction({type:'supplier_add'});
 queuedWindow.XiaoLa.open({orderId:'FIRST'});
-queuedWindow.XiaoLa.open({orderId:'SECOND',action:'prepareJiaofeiyiCashier'});
+queuedWindow.XiaoLa.open({orderId:'SECOND',action:'prepareJiaofeiyiCashier',invoice:{buyer:{name:'测试购方',secret:'drop'},items:[{goods_name:'服务',tax_rate:'0.06',untrusted:'drop'}],trade_no_list:[{out_trade_no:'T1',pay_type:'01'}]}});
 assert.equal(queuedSent.length,0);
 queuedListeners.load();
-assert.equal(queuedSent.length,2);
+assert.equal(queuedSent.length,3);
 assert.equal(queuedSent[1][0].record.orderId,'SECOND');
 assert.equal(queuedSent[1][0].record.action,'prepareJiaofeiyiCashier');
+assert.equal(queuedSent[2][0].type,'xiaola:workbench-action');assert.equal(queuedSent[2][0].action.type,'supplier_add');
+assert.equal(queuedSent[1][0].record.invoice.buyer.name,'测试购方');assert.equal(queuedSent[1][0].record.invoice.buyer.secret,undefined);assert.equal(queuedSent[1][0].record.invoice.items[0].goods_name,'服务');assert.equal(queuedSent[1][0].record.invoice.items[0].untrusted,undefined);
 console.log('embed loader, resize and origin checks passed');
+

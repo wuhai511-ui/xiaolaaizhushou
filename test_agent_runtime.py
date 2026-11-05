@@ -19,6 +19,11 @@ class AgentTests(unittest.TestCase):
   with self.assertRaises(AgentError):self.a.approve(r['sessionId'],r['approvalId'],True)
  def test_unknown_tool_even_readonly_hint_needs_confirmation(self):
   self.a._model=Mock(return_value=call('newReadTool',{'id':'1'}));r=self.a.turn('','测试',{});self.assertEqual(r['state'],'approval');self.upstream.assert_not_called();d=self.a.approve(r['sessionId'],r['approvalId'],False);self.assertEqual(d['trace'],[]);self.upstream.assert_not_called()
+ def test_agent_must_not_prepare_invoice_without_user_request(self):
+  self.a.discover=lambda:[tool('lqInvoiceCreate')]
+  self.a._model=Mock(side_effect=[call('lqInvoiceCreate',{'id':'1'}),{'content':'是否需要开票？'}])
+  result=self.a.turn('','查询支付状态',{})
+  self.assertNotEqual(result['state'],'approval');self.upstream.assert_not_called()
  def test_missing_required_never_executes(self):
   self.a._model=Mock(side_effect=[call('qztMemberOpen',{}),{'content':'请提供编号'}]);r=self.a.turn('','开通',{});self.assertIn('编号',r['answer']);self.upstream.assert_not_called()
  def test_failed_write_not_retried(self):

@@ -1,5 +1,12 @@
 """Local demo server with a fixed, read-only MCP discovery endpoint."""
 import json
+import logging
+import sys
+import traceback
+from logging.handlers import RotatingFileHandler
+import sqlite3
+import hashlib
+from contextlib import closing
 import re
 import tomllib
 import subprocess
@@ -11,13 +18,14 @@ import base64
 import binascii
 from agent_runtime import DemoAgent, AgentError
 from agent_journal import AgentJournal
+from workbench_store import WorkbenchStore
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
 from urllib.parse import urlsplit, parse_qs
 
-UPSTREAM = 'https://example.invalid/mcp'
+UPSTREAM = 'http://yxzy.vegclubs.com:9527/mcp'
 ALLOWED = {'jiaofeiyiOrderQuery', 'lqInvoiceQuery', 'qztOrderStatusQuery', 'qztPayStatusQuery'}
 RULES = {
     'jiaofeiyiOrderQuery': ({'merchant_no':32,'term_no':16,'out_order_no':32}, {'merchant_no','term_no','out_order_no'}),
@@ -37,7 +45,7 @@ def valid_tool_args(name, args):
         if not re.fullmatch(r'[1-9]\d{0,18}',args[key]): return False
     return True
 
-def safe_tool_result(name, response, request_id):
+def safe_tool_result(name, response, request_id, include_invoice_files=False):
     result=response.get('result', {})
     if response.get('error') or result.get('isError'):
         return {'jsonrpc':'2.0','id':request_id,'result':{'isError':True,'content':[{'type':'text','text':'查询未成功，业务状态未核实。'}]}}
@@ -54,12 +62,28 @@ def safe_tool_result(name, response, request_id):
             'qztOrderStatusQuery':('order_no','out_order_no','order_status','amount'),
             'qztPayStatusQuery':('pay_status','out_order_no','amount','pay_time')}[name]
     base['result' if name.startswith('qzt') else 'resp_data']={k:obj[k] for k in fields if k in obj and isinstance(obj[k],(str,int,bool))}
-    base['data_scope']='仅展示关键字段；请求原文、账户、个人信息和文件链接已省略。'
+    if name=='lqInvoiceQuery' and include_invoice_files and data.get('code')=='000000' and data.get('signature_verified') is True and obj.get('status')=='SUCCESS' and isinstance(obj.get('files'),list):
+        files=[]
+        for item in obj['files'][:10]:
+            if not isinstance(item,dict) or item.get('file_type') not in {'PDF','OFD','XML'}: continue
+            url=item.get('file_url')
+            if not isinstance(url,str) or len(url)>2048 or any(ord(c)<32 or ord(c)==127 for c in url): continue
+            try:
+                parsed=urlsplit(url)
+                if parsed.scheme!='https' or parsed.hostname!='api-sit.piaozone.com' or parsed.username or parsed.password or parsed.port not in (None,443): continue
+            except ValueError: continue
+            files.append({'file_type':item['file_type'],'file_url':url})
+        if files: base['resp_data']['files']=files
+    if name=='jiaofeiyiOrderQuery' and isinstance(obj.get('order_trade_info_list'),list):
+        allowed_trade=('trade_no','log_No','trade_type','trade_status','trade_amount','pay_mode')
+        base['resp_data']['order_trade_info_list']=[{k:entry[k] for k in allowed_trade if k in entry and isinstance(entry[k],(str,int))} for entry in obj['order_trade_info_list'][:10] if isinstance(entry,dict)]
+    base['data_scope']='仅展示关键字段；请求原文、账户及个人信息已省略。' if base.get('resp_data',{}).get('files') else '仅展示关键字段；请求原文、账户、个人信息和文件链接已省略。'
     return {'jsonrpc':'2.0','id':request_id,'result':{'content':[{'type':'text','text':json.dumps(base,ensure_ascii=False)}],'structuredContent':base}}
 STATIC = {'/','/index.html','/style.css','/app.js','/saas.html','/saas.js','/xiaola-widget.js','/xiaola-widget.html','/xiaola-widget.css','/xiaola-widget-app.js','/xiaola-koala-3d.png'}
 STATIC.add('/xiaola-koala-v51.svg')
 STATIC.add('/xiaola-schema.js')
 STATIC.add('/xiaola-chat.js')
+STATIC.update(('/order-detail.html','/order-detail.js','/suppliers.html','/suppliers.js','/workbench-data.js'))
 STATIC.add('/vendor/qrcode-generator-1.4.4.js')
 STATIC.add('/downloads/xiaola-desktop-windows.zip')
 STATIC.update('/xiaola-assets/' + name for name in ('torso-repaired.png','leg-left.png','leg-right.png','arm-left.png','arm-right.png','head.png','closed-eye-left.png','closed-eye-right.png','eye-left.png','eye-right.png','mouth.png'))
@@ -127,14 +151,49 @@ def mcp_headers():
     return headers
 
 pending_calls = {}
+invoice_pending = {}
 pending_lock = threading.Lock()
 
 def upstream_rpc(method, params):
-    payload=json.dumps({'jsonrpc':'2.0','id':7,'method':method,'params':params}).encode()
-    with urlopen(Request(UPSTREAM,data=payload,method='POST',headers=mcp_headers()),timeout=20) as response:
-        result=json.load(response)
-    if not isinstance(result,dict) or result.get('error'): raise ValueError('MCP request failed')
-    return result.get('result',{})
+    audit_id=secrets.token_urlsafe(18);tool=params.get('name','') if method=='tools/call' else 'MCP_tools_list';started=time.monotonic()
+    audit_args=params.get('arguments',{}) if method=='tools/call' else params
+    # 步骤3：在统一 MCP 入口记录请求和结果，调用 ID 用于配对，超时保持结果未知。
+    log_event('mcp.request', call_id=audit_id, method=method, tool=tool, arguments=audit_args)
+    rpc_failed = False
+    workbench_store.audit_start(audit_id,tool,audit_args)
+    try:
+        payload=json.dumps({'jsonrpc':'2.0','id':7,'method':method,'params':params}).encode()
+        with urlopen(Request(UPSTREAM,data=payload,method='POST',headers=mcp_headers()),timeout=20) as response:
+            wire=json.load(response)
+        if not isinstance(wire,dict):raise ValueError('MCP response invalid')
+        result=wire.get('result',{})
+        if not isinstance(result,dict):raise ValueError('MCP result invalid')
+        if wire.get('error'):
+            rpc_failed = True
+            log_event('mcp.response', call_id=audit_id, tool=tool, state='rpc_error', error_code=wire['error'].get('code') if isinstance(wire['error'],dict) else None, duration_ms=int((time.monotonic()-started)*1000))
+            workbench_store.audit_finish(audit_id,'failed',{'error':wire['error']},int((time.monotonic()-started)*1000))
+            raise ValueError('MCP request failed')
+        audit_response=result.get('structuredContent')
+        if not isinstance(audit_response,dict):
+            blocks=result.get('content',[])
+            try:audit_response=json.loads(blocks[0].get('text','{}'))
+            except (ValueError,IndexError,AttributeError,TypeError):
+                # 步骤4：保留非 JSON 错误文本供排障，后续复用审计脱敏及每段 4000 字符限制。
+                text_blocks = [block['text'] for block in blocks[:100] if isinstance(block,dict) and block.get('type')=='text' and isinstance(block.get('text'),str)] if isinstance(blocks,list) else []
+                audit_response = {'format':'text', 'text_blocks':text_blocks, 'message':'非 JSON 响应；文本已保留，每段最多记录 4000 字符'}
+        if method=='tools/list':audit_response={'tools':[x.get('name') for x in result.get('tools',[]) if isinstance(x,dict)],'nextCursor':result.get('nextCursor')}
+        workbench_store.audit_finish(audit_id,'failed' if result.get('isError') else 'returned',audit_response,int((time.monotonic()-started)*1000))
+        log_event('mcp.response', call_id=audit_id, tool=tool, state='tool_error' if result.get('isError') else 'returned', response=audit_response, duration_ms=int((time.monotonic()-started)*1000))
+        if method=='tools/call' and tool=='jiaofeiyiOrderQuery' and not result.get('isError'):
+            try:result['_workbench_reconciled']=workbench_store.reconcile_payment(audit_args,audit_response)
+            except Exception:result['_workbench_reconciled']=False
+        return result
+    except Exception as exc:
+        if not rpc_failed:
+            log_event('mcp.error', call_id=audit_id, tool=tool, state='unknown', error_type=type(exc).__name__, duration_ms=int((time.monotonic()-started)*1000))
+        try:workbench_store.audit_finish(audit_id,'unknown',{'message':'调用失败或结果未知'},int((time.monotonic()-started)*1000))
+        except Exception:pass
+        raise
 
 def discover_tools():
     tools=[]; names=set(); cursors=set(); cursor=None
@@ -160,15 +219,18 @@ def prepare_tool(name,args):
     ticket=secrets.token_urlsafe(24)
     with pending_lock:
         now=time.monotonic()
-        for key in [key for key,value in pending_calls.items() if value[0]<now]: pending_calls.pop(key,None)
+        for key in [key for key,value in pending_calls.items() if value[0]<now]:
+            pending_calls.pop(key,None);invoice_pending.pop(key,None)
         if len(pending_calls)>=100: raise ValueError('Too many pending requests')
         pending_calls[ticket]=(now+120,name,args)
     return {'ticket':ticket,'requires_confirmation':name in {'qztMemberOpen','qztOrderConsume','qztOrderComplete','lqInvoiceCreate'} or item.get('annotations',{}).get('readOnlyHint') is not True}
 
 def consume_tool_ticket(ticket):
     if not isinstance(ticket,str): return None
-    with pending_lock: item=pending_calls.pop(ticket,None)
-    return (item[1],item[2]) if item and item[0]>=time.monotonic() else None
+    with pending_lock:
+        item=pending_calls.pop(ticket,None);payment=invoice_pending.pop(ticket,None)
+    if not item or item[0]<time.monotonic(): return None
+    return (item[1],item[2],payment) if payment else (item[1],item[2])
 
 def redact_tool_data(value):
     if isinstance(value,dict):
@@ -227,6 +289,70 @@ def verify_fuel_payment(data,order_no,amount_yuan,merchant_no,term_no):
         return data.get('code')=='000000' and str(result.get('order_status'))=='2' and int(received)==int(amount) and result.get('out_order_no')==order_no and result.get('merchant_no')==merchant_no and result.get('term_no')==term_no
     except (InvalidOperation,TypeError,ValueError,AttributeError): return False
 
+def verify_invoice_payment(payment, invoice):
+    if not isinstance(payment,dict) or set(payment)!={'merchant_no','term_no','out_order_no','total_amount'}: raise ValueError('支付订单信息不完整。')
+    args={key:payment[key] for key in ('merchant_no','term_no','out_order_no')}
+    if not valid_tool_args('jiaofeiyiOrderQuery',args): raise ValueError('支付订单信息无效。')
+    cents=payment.get('total_amount')
+    if not isinstance(cents,str) or not re.fullmatch(r'[1-9]\d{0,11}',cents): raise ValueError('支付金额无效。')
+    amount=invoice.get('invoice_amount') if isinstance(invoice,dict) else None
+    try:
+        if not isinstance(amount,str) or not re.fullmatch(r'(?:0|[1-9]\d{0,9})(?:\.\d{1,2})?',amount) or Decimal(amount)*100!=Decimal(cents): raise ValueError('开票金额与支付金额不一致。')
+    except (InvalidOperation,TypeError): raise ValueError('开票金额无效。')
+    if invoice.get('invoice_type')!='BLUE': raise ValueError('支付后开票仅支持蓝票。')
+    result=upstream_rpc('tools/call',{'name':'jiaofeiyiOrderQuery','arguments':args})
+    if result.get('isError'): raise ValueError('支付查询失败，未发起开票。')
+    raw=result.get('structuredContent')
+    if not isinstance(raw,dict):
+        try: raw=json.loads(result.get('content',[{}])[0].get('text','{}'))
+        except (ValueError,TypeError,IndexError,AttributeError): raise ValueError('支付查询返回无效。')
+    if not verify_fuel_payment(raw,args['out_order_no'],str(Decimal(cents)/100),args['merchant_no'],args['term_no']): raise ValueError('支付状态、商户或金额未核实，未发起开票。')
+    records=raw.get('resp_data',{}).get('order_trade_info_list',[])
+    valid_trades={str(t['trade_no']) for t in records if isinstance(t,dict) and t.get('trade_no') and t.get('trade_type')=='PAY' and t.get('trade_status')=='S' and str(t.get('trade_amount'))==cents} if isinstance(records,list) else set()
+    traces=invoice.get('trade_no_list',[])
+    if traces and (not isinstance(traces,list) or any(not isinstance(t,dict) or t.get('transaction_serial_number') not in valid_trades for t in traces)): raise ValueError('开票交易流水与支付成功记录不一致。')
+    return args
+
+def prepare_paid_invoice(payment,invoice):
+    verify_invoice_payment(payment,invoice)
+    prepared=prepare_tool('lqInvoiceCreate',invoice)
+    with pending_lock: invoice_pending[prepared['ticket']]=dict(payment)
+    prepared['requires_confirmation']=True
+    return prepared
+
+def reserve_paid_invoice(invoice,payment):
+    merchant=invoice.get('merchant_no');request_id=invoice.get('invoice_request_id')
+    if not isinstance(merchant,str) or not merchant.strip() or not isinstance(request_id,str) or not request_id.strip(): raise ValueError('开票商户和开票请求号不能为空。')
+    key=hashlib.sha256((merchant+'\0'+request_id).encode()).hexdigest()
+    payment_key=hashlib.sha256(('\0'.join(payment[k] for k in ('merchant_no','term_no','out_order_no'))).encode()).hexdigest()
+    with closing(sqlite3.connect(str(Path(__file__).resolve().parent/'invoice-journal.local.sqlite3'),timeout=5)) as db:
+        with db:
+            db.execute('CREATE TABLE IF NOT EXISTS invoice_attempts (id TEXT PRIMARY KEY, payment_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, created REAL NOT NULL)')
+            try: db.execute('INSERT INTO invoice_attempts VALUES (?,?,?,?)',(key,payment_key,'started',time.time()))
+            except sqlite3.IntegrityError: raise ValueError('该支付订单或开票请求号已有提交记录，请先查询原开票任务，不要重复提交。')
+
+def release_failed_invoice(invoice, payment, structured):
+    """仅释放已确认未受理的开票防重记录，业务调用审计和日志保持不变。"""
+    # 步骤1：只接受本工具已知的确定失败，未知错误不得作为重新开票依据。
+    error = structured.get('error') if isinstance(structured,dict) else None
+    if not isinstance(error,dict) or error.get('module')!='openPlatform' or error.get('tool')!='lqInvoiceCreate': return False
+    rejected = error.get('code')=='INPUT_ERROR'
+    if error.get('code')=='PLATFORM_ERROR' and error.get('platform_code')=='400003':
+        api = structured.get('api',{})
+        try:
+            raw = json.loads(api.get('response_plaintext','')) if isinstance(api,dict) else None
+            rejected = isinstance(raw,dict) and raw.get('code')=='400003' and 'resp_data' in raw and raw['resp_data'] is None
+        except (ValueError,TypeError): return False
+    if not rejected: return False
+    # 步骤2：同时匹配申请和支付订单，只释放当前失败申请，防止影响其他提交。
+    key = hashlib.sha256((invoice['merchant_no']+'\0'+invoice['invoice_request_id']).encode()).hexdigest()
+    payment_key = hashlib.sha256(('\0'.join(payment[k] for k in ('merchant_no','term_no','out_order_no'))).encode()).hexdigest()
+    with closing(sqlite3.connect(str(Path(__file__).resolve().parent/'invoice-journal.local.sqlite3'),timeout=5)) as db:
+        with db:
+            released = db.execute('DELETE FROM invoice_attempts WHERE id=? AND payment_id=? AND state=?',(key,payment_key,'started')).rowcount==1
+    log_event('invoice.reservation_release', released=released, error_code=error.get('code'), platform_code=error.get('platform_code'))
+    return released
+
 DEMO_DATA=Path(__file__).resolve().parent/'demo-stores.local.json'
 def load_demo_stores():
     """Local demo fixture only; this is not an identity or authorization service."""
@@ -242,13 +368,34 @@ def demo_payment(record):
     if typ not in {'tradeNo','cashierOrderNo','merchantOrderNo'} or not isinstance(ident,str) or not ident.strip() or len(ident)>64 or not isinstance(product,str):return None
     return {'type':typ,'id':ident,'product':product[:32]}
 
+def demo_invoice_defaults(store):
+    raw=store.get('invoiceTestDefaults',{})
+    if not isinstance(raw,dict): return {}
+    def pick(value,keys):
+        if not isinstance(value,dict): return {}
+        return {k:value[k][:128] for k in keys if isinstance(value.get(k),str) and value[k]}
+    out=pick(raw,('merchant_no','channel','invoice_type','invoice_kind','product_type','tax_rate','tax_category_code','trade_pay_type'))
+    for name,keys in (('seller',('address','phone','bank_name','bank_account')),('buyer',('name',))):
+        value=pick(raw.get(name),keys)
+        if value:out[name]=value
+    # 步骤1：仅带入配置的商品及税务资料，金额由当前支付结果提供，避免复用历史金额。
+    if isinstance(raw.get('items'),list):
+        out['items']=[]
+        for index,item in enumerate(raw['items'][:10],1):
+            if not isinstance(item,dict): continue
+            row=pick(item,('goods_name','tax_category_code','tax_rate','quantity','unit','specification','discount_type'))
+            row['line_no']=index
+            if isinstance(item.get('preferential_policy'),bool): row['preferential_policy']=item['preferential_policy']
+            out['items'].append(row)
+    return out
+
 def demo_workspace(store_id=None):
     stores=load_demo_stores()
     if not stores: raise ValueError('没有可用的演示门店。')
     store=next((s for s in stores if s.get('id')==store_id),None) if store_id else stores[0]
     if not store: raise ValueError('演示门店不存在。')
     pay=store.get('jiaofeiyi',{});invoice=store.get('dianpiaotong',{})
-    return {'mode':'demo','stores':[{'id':s['id'],'name':s['name']} for s in stores], 'store':{'id':store['id'],'name':store['name']},'businessContext':{'jiaofeiyi':{'merchantNo':pay.get('merchantNo',''),'terminalNo':pay.get('terminalNo','')},'dianpiaotong':{'merchantNo':invoice.get('merchantNo',''),'channel':invoice.get('channel','')}},'records':[{'id':r['id'],'orderNo':r.get('orderNo',''),'amountYuan':r.get('amountYuan',''),'label':r.get('label','业务记录'),'items':r.get('items',[]),'payment':demo_payment(r)} for r in store.get('records',[])]}
+    return {'mode':'demo','stores':[{'id':s['id'],'name':s['name']} for s in stores], 'store':{'id':store['id'],'name':store['name']},'businessContext':{'jiaofeiyi':{'merchantNo':pay.get('merchantNo',''),'terminalNo':pay.get('terminalNo','')},'dianpiaotong':{'merchantNo':invoice.get('merchantNo','') if invoice.get('mappingStatus')!='unverified_historical_test' else '','channel':invoice.get('channel','') if invoice.get('mappingStatus')!='unverified_historical_test' else ''}},'invoiceCandidate':{'merchantNo':invoice.get('merchantNo',''),'channel':invoice.get('channel',''),'status':'历史测试参数，商户关联待核实'} if invoice.get('mappingStatus')=='unverified_historical_test' else None,'invoiceTestDefaults':demo_invoice_defaults(store),'demoInvoiceMappings':store.get('demoInvoiceMappings',[]),'demoPaymentMappings':store.get('demoPaymentMappings',[]),'records':[{'id':r['id'],'orderNo':r.get('orderNo',''),'amountYuan':r.get('amountYuan',''),'label':r.get('label','业务记录'),'items':r.get('items',[]),'payment':demo_payment(r)} for r in store.get('records',[])]}
 
 def demo_review(store_id,record_id):
     store=next((s for s in load_demo_stores() if s.get('id')==store_id),None)
@@ -349,9 +496,64 @@ def classify_business_intent(text):
 
 agent_journal = AgentJournal(Path(__file__).resolve().parent / "agent-calls.local.sqlite3")
 agent = DemoAgent(discover_tools,upstream_rpc,text_model_settings,redact_tool_data,NoRedirect,valid_tool_args,safe_tool_result,agent_journal)
+workbench_store = WorkbenchStore(Path(__file__).resolve().parent / 'workbench.local.sqlite3', Path(__file__).resolve().parent / 'workbench-db.local.json')
+
+logger = logging.getLogger('xiaola')
+flow_context = threading.local()
+
+def log_event(event, **fields):
+    # 步骤1：复用审计脱敏规则，以流程 ID 关联调用，不记录对话原文与认证头。
+    logger.info('%s', json.dumps({'event': event, 'flow_id': getattr(flow_context, 'id', None),
+                                 **workbench_store.audit_redact(fields)}, ensure_ascii=False))
+
+
+class LocalHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # 步骤1：只记录异常类型和代码位置，避免异常文本携带业务数据或凭据。
+        exc_type, _, tb = sys.exc_info()
+        logger.error('请求处理异常 type=%s\n%s', exc_type.__name__, ''.join(traceback.format_list(traceback.extract_tb(tb))))
 
 class Handler(SimpleHTTPRequestHandler):
+    def log_request(self, code='-', size='-'):
+        if self.path.startswith('/api/'):
+            self.flow_status = code
+
+    def log_message(self, format, *args):
+        pass
+
     def do_POST(self):
+        # 步骤2：为业务请求生成独立流程 ID，在线程复用前清除，避免串日志。
+        flow_context.id = secrets.token_hex(8)
+        started = time.monotonic()
+        self.flow_status = None
+        log_event('flow.start', path=self.path.split('?', 1)[0])
+        try:
+            self.dispatch_post()
+        except Exception as exc:
+            log_event('flow.error', error_type=type(exc).__name__)
+            raise
+        finally:
+            log_event('flow.end', http_status=self.flow_status, duration_ms=int((time.monotonic()-started)*1000))
+            del flow_context.id
+
+    def workbench_request(self,write=False):
+        host=self.headers.get('Host','')
+        if not re.fullmatch(r'(127\.0\.0\.1|localhost):8098',host) or (write and (self.headers.get('Origin')!='http://'+host or self.headers.get_content_type()!='application/json')):
+            self.send_error(403);return
+        try:
+            if write:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 1<=length<=250000:raise ValueError('请求大小无效')
+                event=json.loads(self.rfile.read(length));
+                if isinstance(event,dict) and event.get('kind')=='payment' and event.get('state')=='paid':raise ValueError('支付成功状态须由平台查询确认')
+                saved=workbench_store.save(event);data={'ok':saved,'message':'记录已保存' if saved else '记录冲突或已存在，未执行更新。'};status=200 if saved else 409
+            else:data={'ok':True,**workbench_store.snapshot()};status=200
+        except (ValueError,TypeError,json.JSONDecodeError):data={'ok':False,'message':'记录格式无效。'};status=400
+        except Exception:data={'ok':False,'message':'工作台数据库不可用，记录未保存。'};status=503
+        body=json.dumps(data,ensure_ascii=False).encode();self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+    def dispatch_post(self):
+        if self.path=='/api/workbench/save':
+            return self.workbench_request(True)
         if self.path in ('/api/agent/turn','/api/agent/approve'):
             return self.agent_request()
         if self.path=='/api/chat/intent':
@@ -360,7 +562,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.demo_review_request()
         if self.path in ('/api/vision/recognize','/api/fuel/verify'):
             return self.fuel_workflow()
-        if self.path in ('/api/mcp/prepare','/api/mcp/execute'):
+        if self.path in ('/api/mcp/prepare','/api/mcp/execute','/api/invoice/prepare'):
             return self.generic_mcp()
         if self.path == '/mcp':
             return self.do_readonly_mcp()
@@ -388,10 +590,8 @@ class Handler(SimpleHTTPRequestHandler):
         payload = json.dumps({'jsonrpc':'2.0','id':3,'method':'tools/call','params':{'name':'qztOrderStatusQuery','arguments':args}}).encode()
         req = Request(UPSTREAM, data=payload, method='POST', headers=mcp_headers())
         try:
-            with urlopen(req, timeout=15) as response:
-                data = json.load(response)
-            result = data.get('result', {})
-            if data.get('error') or result.get('isError'):
+            result=upstream_rpc('tools/call',{'name':'qztOrderStatusQuery','arguments':args})
+            if result.get('isError'):
                 output = {'ok':False,'message':'查询未成功，结果未核实。'}
             else:
                 structured = result.get('structuredContent')
@@ -426,6 +626,7 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 if set(data)!={'sessionId','approvalId','approved'} or not isinstance(data['sessionId'],str):raise AgentError('请求格式错误。')
                 result=agent.approve(data['sessionId'],data['approvalId'],data['approved'])
+            log_event('agent.result', state=result.get('state'), tools=[{'name': item.get('name'), 'status': item.get('status')} for item in result.get('trace',[])])
             output={'ok':True,**result};status=200
         except (AgentError,ValueError,json.JSONDecodeError) as exc:output={'ok':False,'message':str(exc)};status=400
         except Exception:output={'ok':False,'message':'模型或 MCP 服务不可用；业务状态未核实。'};status=502
@@ -448,6 +649,7 @@ class Handler(SimpleHTTPRequestHandler):
         host=self.headers.get('Host','')
         if not re.fullmatch(r'(127\.0\.0\.1|localhost):8098',host) or self.headers.get('Origin')!='http://'+host or self.headers.get_content_type()!='application/json':
             self.send_error(403);return
+        sent=False
         try:
             length=int(self.headers.get('Content-Length','0'))
             if not 1<=length<=65536: raise ValueError('Invalid size')
@@ -456,20 +658,29 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path=='/api/mcp/prepare':
                 if set(data)!={'name','arguments'}: raise ValueError('Invalid request')
                 output={'ok':True,**prepare_tool(data['name'],data['arguments'])}
+            elif self.path=='/api/invoice/prepare':
+                if set(data)!={'payment','arguments'} or not isinstance(data['arguments'],dict): raise ValueError('开票请求无效。')
+                output={'ok':True,**prepare_paid_invoice(data['payment'],data['arguments'])}
             else:
                 if set(data)!={'ticket'}: raise ValueError('Invalid request')
                 call=consume_tool_ticket(data['ticket'])
                 if call is None: raise ValueError('Confirmation expired or used')
+                if len(call)==3:
+                    verify_invoice_payment(call[2],call[1]);reserve_paid_invoice(call[1],call[2])
+                sent=True
                 result=upstream_rpc('tools/call',{'name':call[0],'arguments':call[1]})
                 structured=result.get('structuredContent')
                 if not isinstance(structured,dict):
                     blocks=result.get('content',[])
                     try: structured=json.loads(blocks[0].get('text','{}'))
                     except (ValueError,IndexError,AttributeError,TypeError): structured={'message':'返回了非结构化内容，请在业务系统中核实。'}
+                # 步骤3：仅在收到确定失败响应后解除占用，网络或解析异常仍保留防重。
+                if len(call)==3 and call[0]=='lqInvoiceCreate' and result.get('isError') is True:
+                    release_failed_invoice(call[1],call[2],structured)
                 output={'ok':not result.get('isError',False),'data':redact_tool_data(structured), **({'outcome':'tool_error','message':'MCP 工具返回错误，请核实业务状态。'} if result.get('isError',False) else {})}
             status=200
         except ValueError as exc:
-            status=400;output={'ok':False,'message':str(exc)}
+            status=400;output={'ok':False,'message':str(exc),'outcome':'unknown' if sent else 'not_started'}
         except Exception:
             status=502;output={'ok':False,'message':'调用未完成或结果未知，请先核实原业务记录，不要直接重复操作。'}
         body=json.dumps(output,ensure_ascii=False).encode()
@@ -533,11 +744,15 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError,json.JSONDecodeError):
             self.send_error(400,'Invalid tool or arguments'); return
         try:
-            payload=json.dumps({'jsonrpc':'2.0','id':4,'method':'tools/call','params':req_data}).encode()
-            req=Request(UPSTREAM,data=payload,method='POST',headers=mcp_headers())
-            with urlopen(req,timeout=20) as upstream: data=json.load(upstream)
-            safe=safe_tool_result(req_data['name'],data,4)['result']
-            output={'ok':not safe.get('isError',False),'data':safe.get('structuredContent'), 'message': '已返回业务结果，请以状态字段为准。' if not safe.get('isError',False) else '查询未成功，业务状态未核实。'}
+            result=upstream_rpc('tools/call',req_data)
+            safe=safe_tool_result(req_data['name'],{'result':result},4,include_invoice_files=True)['result']
+            message='查询未成功，业务状态未核实。'
+            if result.get('isError'):
+                try:
+                    failure=json.loads(result.get('content',[{}])[0].get('text','{}'));code=str(failure.get('error',{}).get('platform_code',''))
+                    if re.fullmatch(r'[A-Za-z0-9_-]{1,16}',code):message='业务平台返回错误码 '+code+'，状态未核实。'
+                except (ValueError,IndexError,AttributeError,TypeError):pass
+            output={'ok':not safe.get('isError',False),'data':safe.get('structuredContent'),'reconciled':result.get('_workbench_reconciled'), 'message': '已返回业务结果，请以状态字段为准。' if not safe.get('isError',False) else message}
         except Exception:
             output={'ok':False,'message':'查询失败或返回格式无法确认，业务状态未核实。'}
         body=json.dumps(output,ensure_ascii=False).encode('utf-8')
@@ -600,10 +815,7 @@ class Handler(SimpleHTTPRequestHandler):
                     args = params.get('arguments', {})
                     if not valid_tool_args(params.get('name'),args):
                         raise ValueError('tool not permitted')
-                payload = json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode()
-                req = Request(UPSTREAM, data=payload, method='POST', headers=mcp_headers())
-                with urlopen(req, timeout=20) as upstream:
-                    response = json.load(upstream)
+                response={'jsonrpc':'2.0','id':request_id,'result':upstream_rpc(method,params)}
                 if method == 'tools/list':
                     items = response.get('result', {}).get('tools')
                     if not isinstance(items, list): raise ValueError('bad tools response')
@@ -622,6 +834,12 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def do_GET(self):
+        if self.path=='/api/workbench/state': return self.workbench_request()
+        if self.path=='/api/workbench/mcp-calls':
+            if not re.fullmatch(r'(127\.0\.0\.1|localhost):8098',self.headers.get('Host','')):self.send_error(403);return
+            try:data={'ok':True,'calls':workbench_store.audit_list()};status=200
+            except Exception:data={'ok':False,'message':'调用记录暂不可用。'};status=503
+            body=json.dumps(data,ensure_ascii=False).encode();self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
         if urlsplit(self.path).path=='/api/demo/workspace':
             host=self.headers.get('Host','')
             if not re.fullmatch(r'(127\.0\.0\.1|localhost):8098',host):self.send_error(403);return
@@ -652,11 +870,8 @@ class Handler(SimpleHTTPRequestHandler):
             if urlsplit(self.path).path not in STATIC:
                 self.send_error(404); return
             return super().do_GET()
-        payload = json.dumps({'jsonrpc':'2.0','id':2,'method':'tools/list','params':{}}).encode()
-        req = Request(UPSTREAM, data=payload, method='POST', headers=mcp_headers())
         try:
-            with urlopen(req, timeout=15) as response:
-                data = json.load(response)
+            data={'result':upstream_rpc('tools/list',{})}
             if not isinstance(data.get('result', {}).get('tools'), list):
                 raise ValueError('Invalid tools/list response')
             tools = [{'name': x['name'], 'required': x.get('inputSchema',{}).get('required',[])} for x in data.get('result',{}).get('tools',[]) if x.get('name') in ALLOWED and x.get('annotations',{}).get('readOnlyHint') is True]
@@ -674,7 +889,27 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 if __name__ == '__main__':
-    print('打开 http://127.0.0.1:8098', flush=True)
-    httpd=ThreadingHTTPServer(('127.0.0.1', 8098), Handler)
-    agent_journal.recover()
-    httpd.serve_forever()
+    # 步骤4：启动时配置轮转日志，同时保留控制台输出，限制本地磁盘占用。
+    log_dir = Path(__file__).resolve().parent / 'logs'
+    log_dir.mkdir(exist_ok=True)
+    file_handler = RotatingFileHandler(log_dir / 'server.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in (file_handler, logging.StreamHandler()):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    httpd = None
+    try:
+        httpd = LocalHTTPServer(('127.0.0.1', 8098), Handler)
+        agent_journal.recover();workbench_store.audit_recover()
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        logger.error('服务运行异常 type=%s\n%s', sys.exc_info()[0].__name__, ''.join(traceback.format_list(traceback.extract_tb(sys.exc_info()[2]))))
+        raise
+    finally:
+        if httpd is not None:
+            httpd.server_close()
+        logging.shutdown()

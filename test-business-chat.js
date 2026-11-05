@@ -1,5 +1,5 @@
 const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
-const source=fs.readFileSync('xiaola-chat.js','utf8'),start=source.indexOf(' function openChatBusiness(item){'),end=source.indexOf(' async function chatReview()',start);assert(start>0&&end>start);
+const source=fs.readFileSync('xiaola-chat.js','utf8'),start=source.indexOf(' function openChatBusiness(item,flow=null){'),end=source.indexOf(' async function chatReview()',start);assert(start>0&&end>start);
 class El{constructor(tag){this.tagName=tag.toUpperCase();this.children=[];this.textContent='';this.hidden=false;this.disabled=false;this.value='';this.dataset={}}append(...x){this.children.push(...x)}replaceChildren(...x){this.children=x}querySelector(){return null}}
 const pending=new El('div'),lines=[],calls=[];let needsConfirmation=false;
 const c={document:{createElement:t=>new El(t)},pending,mode(){},line:t=>lines.push(t),businessNames:{tool:['产品','测试业务']},buildField:(k,s,r)=>({required:r,element:new El('div'),read:()=> 'v'}),readForm:()=>({field:'v'}),currentPay:()=>({}),hostContext:{dianpiaotong:{}},profile:{},XiaoLaSchema:{businessDefaults:()=>({})},currentRecord:null,epoch:1,busy:false,currentId:'1',record(){},cashierCard(){},post:async(path,body)=>{calls.push(path);return path.endsWith('prepare')?{ticket:'x',requires_confirmation:needsConfirmation}:{data:{status:'OK'}}}};
